@@ -10,15 +10,26 @@ Three kinds of distribution shift are supported, matching the experiment plan:
   - noise shift: increase the label noise std (noise_std)
   - subgroup shift: change the mixture proportion between a low-noise group A
     and a high-noise group B
+
+Two further variants support the adaptive-method experiments:
+  - heteroscedastic noise (hetero=True): noise std = noise_std * (0.2 + |x3|),
+    so difficulty is visible in the inputs, unlike the latent subgroups above
+  - streams (make_stream): x_loc and noise_std vary over time, one value per step
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
 
 N_FEATURES = 4
+
+# A seed is either an int or a tuple of ints, e.g. (experiment_id, level, trial).
+# numpy's default_rng turns a tuple into an independent stream via SeedSequence,
+# which is how the repeated-trial experiments get reproducible, non-overlapping draws.
+Seed = int | Sequence[int]
 
 
 def true_function(X: np.ndarray) -> np.ndarray:
@@ -27,26 +38,50 @@ def true_function(X: np.ndarray) -> np.ndarray:
     return 2.0 * x0 - 1.5 * x1 + 0.8 * x2**2 + np.sin(2.0 * x3)
 
 
+def hetero_noise_scale(X: np.ndarray) -> np.ndarray:
+    """Relative noise std for the heteroscedastic variant: 0.2 + |x3|."""
+    return 0.2 + np.abs(X[:, 3])
+
+
 def make_data(
     n: int,
-    seed: int,
-    x_loc: float = 0.0,
+    seed: Seed,
+    x_loc: float | np.ndarray = 0.0,
     x_scale: float = 1.0,
     noise_std: float = 1.0,
+    hetero: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Draw n i.i.d. samples (X, y) from the synthetic model.
 
     x_loc / x_scale control covariate shift, noise_std controls noise shift.
+    x_loc may be a length-N_FEATURES array to shift individual features.
+    With hetero=True the noise std is noise_std * hetero_noise_scale(x).
     """
     rng = np.random.default_rng(seed)
     X = rng.normal(loc=x_loc, scale=x_scale, size=(n, N_FEATURES))
-    y = true_function(X) + rng.normal(0.0, noise_std, size=n)
+    if hetero:
+        noise = rng.normal(0.0, 1.0, size=n) * noise_std * hetero_noise_scale(X)
+    else:
+        noise = rng.normal(0.0, noise_std, size=n)
+    return X, true_function(X) + noise
+
+
+def make_stream(
+    seed: Seed, x_loc_path: np.ndarray, noise_std_path: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Draw a time-ordered stream: at step t, x_t ~ N(x_loc_path[t], I) and
+    y_t = f(x_t) + Normal(0, noise_std_path[t]). The two paths set the length."""
+    x_loc_path = np.asarray(x_loc_path, dtype=float)
+    noise_std_path = np.asarray(noise_std_path, dtype=float)
+    rng = np.random.default_rng(seed)
+    X = rng.normal(size=(len(x_loc_path), N_FEATURES)) + x_loc_path[:, None]
+    y = true_function(X) + rng.normal(size=len(X)) * noise_std_path
     return X, y
 
 
 def make_subgroup_data(
     n: int,
-    seed: int,
+    seed: Seed,
     frac_b: float,
     noise_std_a: float = 1.0,
     noise_std_b: float = 2.5,
@@ -75,6 +110,21 @@ def make_subgroup_data(
 
     perm = rng.permutation(len(y))
     return X[perm], y[perm], group[perm]
+
+
+def covariate_shift_log_weight(
+    X: np.ndarray, x_loc: float, base_loc: float = 0.0, x_scale: float = 1.0
+) -> np.ndarray:
+    """Exact log likelihood ratio log[p_test(x) / p_calib(x)] for covariate shift.
+
+    Calibration inputs are N(base_loc * 1, x_scale^2 I) and test inputs are
+    N(x_loc * 1, x_scale^2 I), so with mu = (x_loc - base_loc) * 1:
+        log w(x) = mu . (x - base_loc * 1) / x_scale^2 - |mu|^2 / (2 x_scale^2).
+    These are the "oracle" weights for weighted conformal prediction.
+    """
+    delta = x_loc - base_loc
+    d = X.shape[1]
+    return (delta * (X - base_loc).sum(axis=1) - 0.5 * d * delta**2) / x_scale**2
 
 
 @dataclass
